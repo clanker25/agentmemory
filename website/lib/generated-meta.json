@@ -1,0 +1,15 @@
+{
+  "version": "0.9.32",
+  "mcpTools": 54,
+  "hooks": 12,
+  "restEndpoints": 147,
+  "testCases": "4400+",
+  "stars": 30133,
+  "forks": 2668,
+  "contributors": 32,
+  "releases": 53,
+  "npmWeekly": 17188,
+  "npmMonthly": 61907,
+  "npmAllTime": 572854,
+  "generatedAt": "2026-11-04T18:22:21.410Z"
+}
