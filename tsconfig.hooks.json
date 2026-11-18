@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "types": ["node"]
+  },
+  "include": ["src/hooks/**/*.ts"],
+  "exclude": ["node_modules", "dist", "test"]
+}
