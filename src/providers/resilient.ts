@@ -1,0 +1,56 @@
+import type { MemoryProvider, CircuitBreakerState } from "../types.js";
+import { CircuitBreaker } from "./circuit-breaker.js";
+
+const FILTER_CODE = /content_filter|ResponsibleAIPolicyViolation/;
+const REJECTED_STATUS = /^[^{]*\(400\)/;
+
+export function isPayloadRejection(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return REJECTED_STATUS.test(message) && FILTER_CODE.test(message);
+}
+
+export class ResilientProvider implements MemoryProvider {
+  private breaker = new CircuitBreaker();
+  name: string;
+  declare readonly describeImage?: MemoryProvider["describeImage"];
+
+  constructor(private inner: MemoryProvider) {
+    this.name = `resilient(${inner.name})`;
+    const describeImage = inner.describeImage;
+    if (typeof describeImage === "function") {
+      this.describeImage = (imageData, mimeType, prompt) =>
+        this.call(() => describeImage.call(inner, imageData, mimeType, prompt));
+    }
+  }
+
+  private async call(fn: () => Promise<string>): Promise<string> {
+    const probe = this.breaker.admit();
+    if (probe === null) {
+      throw new Error("circuit_breaker_open");
+    }
+    try {
+      const result = await fn();
+      this.breaker.recordSuccess(probe);
+      return result;
+    } catch (err) {
+      if (isPayloadRejection(err)) {
+        this.breaker.releaseProbe(probe);
+      } else {
+        this.breaker.recordFailure(probe);
+      }
+      throw err;
+    }
+  }
+
+  async compress(systemPrompt: string, userPrompt: string): Promise<string> {
+    return this.call(() => this.inner.compress(systemPrompt, userPrompt));
+  }
+
+  async summarize(systemPrompt: string, userPrompt: string): Promise<string> {
+    return this.call(() => this.inner.summarize(systemPrompt, userPrompt));
+  }
+
+  get circuitState(): CircuitBreakerState {
+    return this.breaker.getState();
+  }
+}
